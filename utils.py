@@ -1,27 +1,65 @@
 from __future__ import annotations
 import os
 import subprocess
+import glob
 from typing import Iterable
 
-# ── Fix Kaggle/Colab environment issues ──
-# 1. Force triton attention backend (FlashInfer JIT fails on Kaggle)
-os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
 
-# 2. Create missing libcuda.so symlink if needed
-_cuda_stub = "/usr/local/cuda/lib64/stubs/libcuda.so"
-if not os.path.exists(_cuda_stub):
-    for candidate in [
-        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
-        "/usr/lib/x86_64-linux-gnu/libcuda.so",
-    ]:
-        if os.path.exists(candidate):
-            os.makedirs(os.path.dirname(_cuda_stub), exist_ok=True)
-            try:
-                os.symlink(candidate, _cuda_stub)
-            except OSError:
-                subprocess.run(["ln", "-sf", candidate, _cuda_stub],
-                               check=False)
+# ══════════════════════════════════════════════════════════════
+# Kaggle / Colab environment fixes — must run BEFORE vllm import
+# ══════════════════════════════════════════════════════════════
+
+# Fix 1: Create libcuda.so symlink (FlashInfer linker needs it)
+# Kaggle has libcuda.so.1 but not libcuda.so, and stubs/ may be read-only
+def _fix_libcuda():
+    """Find libcuda.so.1 and ensure libcuda.so exists somewhere on LD path."""
+    # Find the actual libcuda
+    candidates = glob.glob("/usr/lib/x86_64-linux-gnu/libcuda.so*") + \
+                 glob.glob("/usr/local/cuda/lib64/libcuda.so*") + \
+                 glob.glob("/usr/lib64/libcuda.so*")
+
+    source = None
+    for c in candidates:
+        if os.path.exists(c) and not os.path.islink(c):
+            source = c
             break
+        elif os.path.exists(c):
+            source = c
+            break
+
+    if source is None:
+        return
+
+    # Try multiple writable locations
+    link_targets = [
+        "/usr/local/cuda/lib64/stubs/libcuda.so",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so",
+        "/usr/local/lib/libcuda.so",
+    ]
+
+    for target in link_targets:
+        if os.path.exists(target):
+            return  # Already exists
+        try:
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            os.symlink(source, target)
+            # Add to library path if non-standard location
+            ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+            target_dir = os.path.dirname(target)
+            if target_dir not in ld_path:
+                os.environ["LD_LIBRARY_PATH"] = f"{target_dir}:{ld_path}"
+            return
+        except OSError:
+            continue
+
+
+_fix_libcuda()
+
+# Fix 2: Disable FlashInfer entirely — it needs JIT compilation
+# which fails on Kaggle due to missing libcuda.so in stubs.
+# Force vLLM to use V0 engine which supports XFORMERS/TRITON backends.
+os.environ["VLLM_USE_V1"] = "0"  # Force V0 engine
+os.environ["VLLM_ATTENTION_BACKEND"] = "XFORMERS"  # V0 supports this
 
 from vllm import LLM, SamplingParams
 
@@ -59,9 +97,9 @@ def load_vllm_llm(model_id, tensor_parallel_size: int = 1, **kwargs):
     # Determine if this is a quantized model by checking the name
     quantization = None
     if "AWQ" in model_id or "awq" in model_id:
-        quantization = "awq_marlin"
+        quantization = "awq"
     elif "GPTQ" in model_id or "gptq" in model_id:
-        quantization = "gptq_marlin"
+        quantization = "gptq"
 
     llm = LLM(
         model=model_id,
@@ -78,13 +116,13 @@ def load_vllm_llm(model_id, tensor_parallel_size: int = 1, **kwargs):
 
 
 def prompt_vllm(
-    llm,
-    tokenizer,
-    batch_messages: Iterable[list[dict]],
-    max_new_tokens: int = 16,
-    temperature: float = 0.0,
-    top_p: float = 1.0,
-    use_tqdm: bool = True,
+        llm,
+        tokenizer,
+        batch_messages: Iterable[list[dict]],
+        max_new_tokens: int = 16,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        use_tqdm: bool = True,
 ):
     prompts = [build_vllm_prompt(tokenizer, messages) for messages in batch_messages]
     sampling_params = SamplingParams(
