@@ -1,5 +1,28 @@
 from __future__ import annotations
+import os
+import subprocess
 from typing import Iterable
+
+# ── Fix Kaggle/Colab environment issues ──
+# 1. Force triton attention backend (FlashInfer JIT fails on Kaggle)
+os.environ["VLLM_ATTENTION_BACKEND"] = "TRITON_ATTN"
+
+# 2. Create missing libcuda.so symlink if needed
+_cuda_stub = "/usr/local/cuda/lib64/stubs/libcuda.so"
+if not os.path.exists(_cuda_stub):
+    for candidate in [
+        "/usr/lib/x86_64-linux-gnu/libcuda.so.1",
+        "/usr/lib/x86_64-linux-gnu/libcuda.so",
+    ]:
+        if os.path.exists(candidate):
+            os.makedirs(os.path.dirname(_cuda_stub), exist_ok=True)
+            try:
+                os.symlink(candidate, _cuda_stub)
+            except OSError:
+                subprocess.run(["ln", "-sf", candidate, _cuda_stub],
+                               check=False)
+            break
+
 from vllm import LLM, SamplingParams
 
 MMLU_TEMPLATE = '''Answer the following multiple choice question. The last line of your response should be of the following format: '#### ANSWER: [LETTER]' (without quotes) where [LETTER] is one of {letters}. Think step by step before answering.
@@ -36,9 +59,9 @@ def load_vllm_llm(model_id, tensor_parallel_size: int = 1, **kwargs):
     # Determine if this is a quantized model by checking the name
     quantization = None
     if "AWQ" in model_id or "awq" in model_id:
-        quantization = "awq"
+        quantization = "awq_marlin"
     elif "GPTQ" in model_id or "gptq" in model_id:
-        quantization = "gptq"
+        quantization = "gptq_marlin"
 
     llm = LLM(
         model=model_id,
