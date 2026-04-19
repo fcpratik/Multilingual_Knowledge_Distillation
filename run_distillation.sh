@@ -7,7 +7,7 @@
 set -e  # Exit on error
 
 # ── Configuration ──
-TEACHER_MODEL="Qwen/Qwen2.5-7B-Instruct"
+TEACHER_MODEL="Qwen/Qwen2.5-7B-Instruct-AWQ"
 STUDENT_QWEN="Qwen/Qwen2.5-1.5B-Instruct"
 STUDENT_LLAMA="meta-llama/Llama-3.2-1B-Instruct"
 

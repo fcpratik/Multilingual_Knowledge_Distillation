@@ -33,10 +33,21 @@ def build_vllm_prompt(tokenizer, messages):
 
 
 def load_vllm_llm(model_id, tensor_parallel_size: int = 1, **kwargs):
+    # Determine if this is a quantized model by checking the name
+    quantization = None
+    if "AWQ" in model_id or "awq" in model_id:
+        quantization = "awq"
+    elif "GPTQ" in model_id or "gptq" in model_id:
+        quantization = "gptq"
+
     llm = LLM(
         model=model_id,
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
+        max_model_len=4096,
+        dtype="half",
+        enforce_eager=True,
+        quantization=quantization,
         **kwargs,
     )
     tokenizer = llm.get_tokenizer()
