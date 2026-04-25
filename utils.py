@@ -1,33 +1,10 @@
 from __future__ import annotations
-import os
-import glob
 import time
+import logging
 from typing import Iterable
-
-# ── Kaggle environment fixes (before vllm import) ──
-os.environ["VLLM_ATTENTION_BACKEND"] = "XFORMERS"
-
-def _fix_libcuda():
-    candidates = glob.glob("/usr/lib/x86_64-linux-gnu/libcuda.so*") + \
-                 glob.glob("/usr/local/cuda/lib64/libcuda.so*")
-    source = next((c for c in candidates if os.path.exists(c)), None)
-    if not source:
-        return
-    for target in ["/usr/local/cuda/lib64/stubs/libcuda.so",
-                   "/usr/lib/x86_64-linux-gnu/libcuda.so",
-                   "/usr/local/lib/libcuda.so"]:
-        if os.path.exists(target):
-            return
-        try:
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            os.symlink(source, target)
-            return
-        except OSError:
-            continue
-
-_fix_libcuda()
-
 from vllm import LLM, SamplingParams
+
+LOGGER = logging.getLogger(__name__)
 
 MMLU_TEMPLATE = '''Answer the following multiple choice question. The last line of your response should be of the following format: '#### ANSWER: [LETTER]' (without quotes) where [LETTER] is one of {letters}. Think step by step before answering.
 
@@ -55,6 +32,7 @@ def build_vllm_prompt(tokenizer, messages):
 
 
 def load_vllm_llm(model_id, tensor_parallel_size: int = 1, **kwargs):
+    """Load model with vLLM. Works on V100 32GB without quantization for 7B models."""
     quantization = None
     if "AWQ" in model_id or "awq" in model_id:
         quantization = "awq"
@@ -66,8 +44,7 @@ def load_vllm_llm(model_id, tensor_parallel_size: int = 1, **kwargs):
         tensor_parallel_size=tensor_parallel_size,
         trust_remote_code=True,
         max_model_len=4096,
-        dtype="half",
-        enforce_eager=True,
+        dtype="auto",
         quantization=quantization,
         **kwargs,
     )
@@ -92,7 +69,7 @@ def prompt_vllm(
 
 
 class TimeGuard:
-    """Track elapsed time and check if we're approaching the deadline."""
+    """Track elapsed time and stop before deadline."""
     def __init__(self, limit_minutes: int, safety_margin_minutes: int = 10):
         self.start = time.time()
         self.limit = limit_minutes * 60

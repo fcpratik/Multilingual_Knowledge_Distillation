@@ -5,7 +5,6 @@ import json
 import logging
 import random
 import re
-import time
 from pathlib import Path
 from typing import Any
 
@@ -34,18 +33,17 @@ def setup_logger(level: str) -> None:
                         format="%(asctime)s | %(levelname)s | %(message)s", force=True)
 
 
-def _options_to_text(options: list[str]) -> str:
-    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    return "\n".join(f"({letters[i]}) {c}" for i, c in enumerate(options))
+def _options_to_text(options):
+    return "\n".join(f"({chr(65+i)}) {c}" for i, c in enumerate(options))
 
 
-def _normalize_language(raw: str) -> str:
+def _normalize_language(raw):
     return LANG_CODE_TO_FULL.get(raw.lower().strip(), raw.lower().strip())
 
 
-def _build_instruction(row: dict[str, Any]) -> str:
-    options = row["options"] if isinstance(row["options"], list) else list(row["options"])
-    return f"{row['question']}\n\n{_options_to_text(options)}"
+def _build_instruction(row):
+    opts = row["options"] if isinstance(row["options"], list) else list(row["options"])
+    return f"{row['question']}\n\n{_options_to_text(opts)}"
 
 
 def sample_datasets(samples_per_language, dataset_path="data/dataset.jsonl", seed=42):
@@ -57,81 +55,70 @@ def sample_datasets(samples_per_language, dataset_path="data/dataset.jsonl", see
                 row["language"] = _normalize_language(row.get("language", "en"))
                 full_data.append(row)
 
-    LOGGER.info("Loaded %d total instances from %s", len(full_data), dataset_path)
+    LOGGER.info("Loaded %d instances from %s", len(full_data), dataset_path)
     by_lang = {lang: [] for lang in LANGUAGES}
     for row in full_data:
         if row["language"] in by_lang:
             by_lang[row["language"]].append(row)
 
-    for lang in LANGUAGES:
-        LOGGER.info("  %s: %d available", lang, len(by_lang[lang]))
-
     rng = random.Random(seed)
     sampled = []
     for lang, count in zip(LANGUAGES, samples_per_language):
-        avail = by_lang[lang]
-        n = min(count, len(avail))
-        sampled.extend(rng.sample(avail, n))
-        LOGGER.info("  Sampled %d for %s", n, lang)
+        n = min(count, len(by_lang[lang]))
+        sampled.extend(rng.sample(by_lang[lang], n))
+        LOGGER.info("  Sampled %d / %d for %s", n, len(by_lang[lang]), lang)
 
     rng.shuffle(sampled)
-    LOGGER.info("Total sampled: %d (limit: 10000)", len(sampled))
+    LOGGER.info("Total sampled: %d", len(sampled))
     return Dataset.from_list(sampled)
 
 
-def format_teacher_prompt(instruction: str, language: str) -> str:
+def format_teacher_prompt(instruction, language):
     lang_inst = LANG_REASONING_INSTRUCTION.get(language, LANG_REASONING_INSTRUCTION["english"])
     return (
         f"You are an expert problem solver. {lang_inst}\n\n"
         f"Follow this format strictly:\n"
-        f"1. First, provide your detailed step-by-step reasoning inside "
-        f"<reasoning> and </reasoning> tags.\n"
-        f"2. After </reasoning>, write your final answer on a new line in "
-        f"exactly this format: #### ANSWER: (X)\n"
-        f"   where X is the letter of the correct option.\n\n"
+        f"1. Provide detailed step-by-step reasoning inside <reasoning> and </reasoning> tags.\n"
+        f"2. After </reasoning>, write: #### ANSWER: (X)\n\n"
         f"{instruction}\n\nNow solve this step by step."
     )
 
 
-def parse_generation(gen: str) -> dict:
-    reasoning_match = REASONING_BLOCK_RE.search(gen)
-    reasoning = reasoning_match.group(1).strip() if reasoning_match else gen.strip()
-    answer_match = ANSWER_RE.search(gen)
-    final_answer = answer_match.group(1).upper() if answer_match else ""
-    return {"reasoning": reasoning, "final_answer": final_answer, "raw_generation": gen.strip()}
+def parse_generation(gen):
+    rm = REASONING_BLOCK_RE.search(gen)
+    reasoning = rm.group(1).strip() if rm else gen.strip()
+    am = ANSWER_RE.search(gen)
+    answer = am.group(1).upper() if am else ""
+    return {"reasoning": reasoning, "final_answer": answer, "raw_generation": gen.strip()}
 
 
 def generate_batch(llm, tokenizer, prompts, max_new_tokens=2048, temperature=0.3):
-    batch_messages = [[{"role": "user", "content": p}] for p in prompts]
-    generations = prompt_vllm(llm, tokenizer, batch_messages,
-                              max_new_tokens=max_new_tokens, temperature=temperature,
-                              top_p=0.95, use_tqdm=True)
-    return [parse_generation(g) for g in generations]
+    msgs = [[{"role": "user", "content": p}] for p in prompts]
+    gens = prompt_vllm(llm, tokenizer, msgs, max_new_tokens=max_new_tokens,
+                       temperature=temperature, top_p=0.95, use_tqdm=True)
+    return [parse_generation(g) for g in gens]
 
 
-def save_records(records, output_path):
-    """Save current records to disk (checkpoint)."""
-    with open(output_path, "w", encoding="utf-8") as fp:
+def save_records(records, path):
+    with open(path, "w", encoding="utf-8") as f:
         for r in records:
-            fp.write(json.dumps(r, ensure_ascii=False) + "\n")
-    LOGGER.info("Checkpoint: saved %d records to %s", len(records), output_path)
+            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    LOGGER.info("Saved %d records to %s", len(records), path)
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Query teacher and build train corpus")
+    p = argparse.ArgumentParser()
     p.add_argument("--teacher_model", required=True)
     p.add_argument("--num_samples", type=str, required=True)
     p.add_argument("--output_file", required=True)
     p.add_argument("--dataset_path", default="data/dataset.jsonl")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--gpu_memory_utilization", type=float, default=0.85)
+    p.add_argument("--gpu_memory_utilization", type=float, default=0.90)
     p.add_argument("--tensor_parallel_size", type=int, default=1)
     p.add_argument("--max_new_tokens", type=int, default=2048)
     p.add_argument("--temperature", type=float, default=0.3)
-    p.add_argument("--batch_size", type=int, default=256,
-                   help="Number of prompts per vLLM batch (vLLM handles internal batching)")
-    p.add_argument("--time_limit", type=int, default=230,
-                   help="Time limit in minutes (saves before this)")
+    p.add_argument("--batch_size", type=int, default=512)
+    p.add_argument("--time_limit", type=int, default=230)
     p.add_argument("--filter_incorrect", action="store_true", default=True)
     p.add_argument("--retry_incorrect", action="store_true", default=True)
     p.add_argument("--log_level", default="INFO")
@@ -143,137 +130,90 @@ def main():
     setup_logger(args.log_level)
     timer = TimeGuard(limit_minutes=args.time_limit, safety_margin_minutes=15)
 
-    # Parse sample counts
     counts = list(map(int, args.num_samples.split(",")))
     assert len(counts) == 5 and sum(counts) <= 10000
 
     LOGGER.info("=" * 60)
-    LOGGER.info("Part A: Distillation Data Creation")
+    LOGGER.info("Part A: Dataset Generation | Teacher: %s", args.teacher_model)
     LOGGER.info("=" * 60)
-    LOGGER.info("Teacher: %s | Budget: %d | Time limit: %d min",
-                args.teacher_model, sum(counts), args.time_limit)
 
     output_path = Path(args.output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Sample ──
     sampled = sample_datasets(counts, args.dataset_path, args.seed)
-    LOGGER.info("Collected %d samples", len(sampled))
 
-    # ── 2. Load teacher ──
     LOGGER.info("Loading teacher model...")
     teacher, tokenizer = load_vllm_llm(
-        model_id=args.teacher_model,
-        tensor_parallel_size=args.tensor_parallel_size,
+        args.teacher_model, tensor_parallel_size=args.tensor_parallel_size,
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
     timer.log_status(LOGGER)
 
-    # ── 3. Build all prompts ──
-    all_prompts = []
-    all_rows = []
+    all_prompts, all_rows = [], []
     for i in range(len(sampled)):
         row = sampled[i]
         all_prompts.append(format_teacher_prompt(_build_instruction(row), row["language"]))
         all_rows.append(row)
 
-    # ── 4. Generate in batches with checkpointing ──
-    correct_records = []
-    incorrect_indices = []
-    batch_size = args.batch_size
-    total = len(all_prompts)
+    correct_records, incorrect_indices = [], []
+    bs = args.batch_size
 
-    LOGGER.info("Generating CoT in batches of %d...", batch_size)
-
-    for start in range(0, total, batch_size):
+    for start in range(0, len(all_prompts), bs):
         if timer.should_stop():
-            LOGGER.warning("TIME LIMIT approaching! Saving what we have...")
+            LOGGER.warning("TIME LIMIT! Saving current progress...")
             break
+        end = min(start + bs, len(all_prompts))
+        LOGGER.info("Batch %d-%d / %d", start, end, len(all_prompts))
 
-        end = min(start + batch_size, total)
-        batch_prompts = all_prompts[start:end]
-
-        LOGGER.info("Batch %d-%d / %d", start, end, total)
-        parsed_batch = generate_batch(teacher, tokenizer, batch_prompts,
-                                      max_new_tokens=args.max_new_tokens,
-                                      temperature=args.temperature)
-
-        for i, parsed in enumerate(parsed_batch):
-            global_idx = start + i
-            row = all_rows[global_idx]
+        parsed = generate_batch(teacher, tokenizer, all_prompts[start:end],
+                                args.max_new_tokens, args.temperature)
+        for i, p in enumerate(parsed):
+            idx = start + i
+            row = all_rows[idx]
             gold = str(row.get("answer", "")).upper().strip()
-            pred = parsed["final_answer"]
-
-            if not pred:
-                incorrect_indices.append(global_idx)
+            if not p["final_answer"] or (args.filter_incorrect and p["final_answer"] != gold):
+                incorrect_indices.append(idx)
                 continue
-            if args.filter_incorrect and pred != gold:
-                incorrect_indices.append(global_idx)
-                continue
-
             correct_records.append({
-                "question": _build_instruction(row),
-                "reasoning": parsed["reasoning"],
-                "final_answer": pred,
-                "gold_answer": gold,
-                "language": row["language"],
-                "subject": row.get("subject", ""),
-                "teacher_generation": parsed["raw_generation"],
+                "question": _build_instruction(row), "reasoning": p["reasoning"],
+                "final_answer": p["final_answer"], "gold_answer": gold,
+                "language": row["language"], "subject": row.get("subject", ""),
+                "teacher_generation": p["raw_generation"],
             })
-
-        # Checkpoint after each batch
         save_records(correct_records, output_path)
         timer.log_status(LOGGER)
 
-    LOGGER.info("First pass: %d correct, %d to retry", len(correct_records), len(incorrect_indices))
+    LOGGER.info("First pass: %d correct, %d incorrect", len(correct_records), len(incorrect_indices))
 
-    # ── 5. Retry incorrect (only if time allows) ──
+    # Retry
     if args.retry_incorrect and incorrect_indices and not timer.should_stop():
-        LOGGER.info("Retrying %d incorrect (temp=0.7)...", len(incorrect_indices))
+        LOGGER.info("Retrying %d incorrect...", len(incorrect_indices))
         retry_prompts = [all_prompts[i] for i in incorrect_indices]
-
-        for start in range(0, len(retry_prompts), batch_size):
+        for start in range(0, len(retry_prompts), bs):
             if timer.should_stop():
-                LOGGER.warning("TIME LIMIT approaching during retry! Stopping.")
                 break
-
-            end = min(start + batch_size, len(retry_prompts))
-            batch = retry_prompts[start:end]
-            parsed_batch = generate_batch(teacher, tokenizer, batch,
-                                          max_new_tokens=args.max_new_tokens,
-                                          temperature=0.7)
-
-            for i, parsed in enumerate(parsed_batch):
-                idx = incorrect_indices[start + i]
-                row = all_rows[idx]
+            end = min(start + bs, len(retry_prompts))
+            parsed = generate_batch(teacher, tokenizer, retry_prompts[start:end],
+                                    args.max_new_tokens, 0.7)
+            for i, p in enumerate(parsed):
+                row = all_rows[incorrect_indices[start + i]]
                 gold = str(row.get("answer", "")).upper().strip()
-                if parsed["final_answer"] == gold:
+                if p["final_answer"] == gold:
                     correct_records.append({
-                        "question": _build_instruction(row),
-                        "reasoning": parsed["reasoning"],
-                        "final_answer": parsed["final_answer"],
-                        "gold_answer": gold,
-                        "language": row["language"],
-                        "subject": row.get("subject", ""),
-                        "teacher_generation": parsed["raw_generation"],
+                        "question": _build_instruction(row), "reasoning": p["reasoning"],
+                        "final_answer": p["final_answer"], "gold_answer": gold,
+                        "language": row["language"], "subject": row.get("subject", ""),
+                        "teacher_generation": p["raw_generation"],
                     })
-
             save_records(correct_records, output_path)
 
-    # ── 6. Final save ──
     save_records(correct_records, output_path)
-
-    lang_counts = {lang: 0 for lang in LANGUAGES}
+    lc = {}
     for r in correct_records:
-        lang_counts[r["language"]] = lang_counts.get(r["language"], 0) + 1
-
-    LOGGER.info("=" * 60)
-    LOGGER.info("FINAL: %d training instances", len(correct_records))
-    for lang in LANGUAGES:
-        LOGGER.info("  %s: %d", lang, lang_counts.get(lang, 0))
-    LOGGER.info("Saved to: %s", output_path)
+        lc[r["language"]] = lc.get(r["language"], 0) + 1
+    LOGGER.info("FINAL: %d instances | %s", len(correct_records),
+                " | ".join(f"{l}: {lc.get(l,0)}" for l in LANGUAGES))
     timer.log_status(LOGGER)
-    LOGGER.info("=" * 60)
 
 
 if __name__ == "__main__":
