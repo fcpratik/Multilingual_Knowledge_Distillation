@@ -8,10 +8,10 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset as TorchDataset
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+    AutoModelForCausalLM, AutoTokenizer,
     TrainingArguments, Trainer, DataCollatorForSeq2Seq, TrainerCallback,
 )
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from peft import LoraConfig, get_peft_model, TaskType
 
 from utils import TimeGuard
 
@@ -96,13 +96,12 @@ class CoTDistillDataset(TorchDataset):
         return {"input_ids": ids, "attention_mask": attn, "labels": labels[:len(ids)]}
 
 
-def load_student_qlora(model_path, lora_rank=32, lora_alpha=64, lora_dropout=0.05):
-    LOGGER.info("Loading %s with QLoRA...", model_path)
-    bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                             bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True)
-    model = AutoModelForCausalLM.from_pretrained(model_path, quantization_config=bnb,
-                                                  device_map="auto", trust_remote_code=True)
-    model = prepare_model_for_kbit_training(model)
+def load_student_lora(model_path, lora_rank=32, lora_alpha=64, lora_dropout=0.05):
+    LOGGER.info("Loading %s with LoRA (fp16)...", model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.float16, trust_remote_code=True,
+    ).cuda()
+    model.enable_input_require_grads()  # needed for LoRA + gradient checkpointing
     lora = LoraConfig(r=lora_rank, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
                       target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
                       bias="none", task_type=TaskType.CAUSAL_LM)
@@ -149,7 +148,7 @@ def main():
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    model, tok = load_student_qlora(args.student_model, args.lora_rank, args.lora_alpha)
+    model, tok = load_student_lora(args.student_model, args.lora_rank, args.lora_alpha)
     timer.log_status(LOGGER)
 
     ds = CoTDistillDataset(args.train_data, tok, args.max_length, args.mask_prompt_tokens)
@@ -160,12 +159,12 @@ def main():
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.lr, weight_decay=0.01, warmup_ratio=args.warmup_ratio,
-        lr_scheduler_type="cosine", bf16=True, logging_steps=10,
+        lr_scheduler_type="cosine", fp16=True, logging_steps=10,
         save_strategy="epoch", save_total_limit=2, seed=args.seed,
         report_to="none", remove_unused_columns=False,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
-        optim="paged_adamw_8bit",
+        optim="adamw_torch",
     )
 
     trainer = Trainer(model=model, args=t_args, train_dataset=ds, data_collator=collator,

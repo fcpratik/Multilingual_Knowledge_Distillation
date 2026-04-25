@@ -66,8 +66,8 @@ def run_inference(base_model, adapter_path, test_data, max_tokens=2048, gpu_mem=
         from peft import PeftModel
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        base = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.bfloat16,
-                                                     trust_remote_code=True, device_map="cpu")
+        base = AutoModelForCausalLM.from_pretrained(base_model, torch_dtype=torch.float16,
+                                                     trust_remote_code=True)
         merged = PeftModel.from_pretrained(base, adapter_path).merge_and_unload()
         merge_dir = Path(adapter_path) / "merged"
         merge_dir.mkdir(parents=True, exist_ok=True)
