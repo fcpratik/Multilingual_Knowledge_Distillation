@@ -52,7 +52,8 @@ class TimeSafeCallback(TrainerCallback):
 
 
 class CoTDistillDataset(TorchDataset):
-    def __init__(self, data_path, tokenizer, max_length=2048, mask_prompt=True):
+    def __init__(self, data_path, tokenizer, max_length=2048, mask_prompt=True,
+                 original_data_path=None, original_data_ratio=0.3):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.mask_prompt = mask_prompt
@@ -61,7 +62,38 @@ class CoTDistillDataset(TorchDataset):
             for line in f:
                 if line.strip():
                     self.samples.append(json.loads(line.strip()))
-        LOGGER.info("Loaded %d samples from %s", len(self.samples), data_path)
+        LOGGER.info("Loaded %d teacher-generated samples from %s", len(self.samples), data_path)
+
+        # Mix in original dataset examples (answer-only, no CoT) if provided
+        if original_data_path and Path(original_data_path).exists():
+            original = []
+            with open(original_data_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.strip():
+                        row = json.loads(line.strip())
+                        # Convert to training format: question + short answer
+                        opts = row["options"] if isinstance(row["options"], list) else list(row["options"])
+                        question = f"{row['question']}\n\n" + "\n".join(
+                            f"({chr(65+i)}) {c}" for i, c in enumerate(opts))
+                        answer = str(row.get("answer", "")).upper().strip()
+                        answer_text = opts[ord(answer) - 65] if answer and ord(answer) - 65 < len(opts) else ""
+                        original.append({
+                            "question": question,
+                            "teacher_generation": f"<reasoning>\nThe answer is ({answer}) {answer_text}.\n</reasoning>\n#### ANSWER: ({answer})",
+                            "final_answer": answer,
+                            "gold_answer": answer,
+                            "language": row.get("language", "en"),
+                        })
+            # Sample a fraction to mix in
+            import random
+            rng = random.Random(42)
+            n_original = min(int(len(self.samples) * original_data_ratio), len(original))
+            if n_original > 0:
+                sampled_original = rng.sample(original, n_original)
+                self.samples.extend(sampled_original)
+                rng.shuffle(self.samples)
+                LOGGER.info("Mixed in %d original dataset samples (ratio=%.2f), total=%d",
+                            n_original, original_data_ratio, len(self.samples))
 
     def __len__(self):
         return len(self.samples)
@@ -130,6 +162,8 @@ def parse_args():
     p.add_argument("--lora_rank", type=int, default=32)
     p.add_argument("--lora_alpha", type=int, default=64)
     p.add_argument("--mask_prompt_tokens", action="store_true", default=True)
+    p.add_argument("--original_data", default=None, help="Path to original dataset.jsonl for supplementary training")
+    p.add_argument("--original_data_ratio", type=float, default=0.3, help="Ratio of original data to mix in")
     p.add_argument("--time_limit", type=int, default=230)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--log_level", default="INFO")
@@ -151,7 +185,9 @@ def main():
     model, tok = load_student_lora(args.student_model, args.lora_rank, args.lora_alpha)
     timer.log_status(LOGGER)
 
-    ds = CoTDistillDataset(args.train_data, tok, args.max_length, args.mask_prompt_tokens)
+    ds = CoTDistillDataset(args.train_data, tok, args.max_length, args.mask_prompt_tokens,
+                           original_data_path=args.original_data,
+                           original_data_ratio=args.original_data_ratio)
     collator = DataCollatorForSeq2Seq(tok, padding=True, pad_to_multiple_of=8, return_tensors="pt")
 
     t_args = TrainingArguments(

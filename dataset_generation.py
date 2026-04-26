@@ -17,14 +17,22 @@ LOGGER = logging.getLogger(__name__)
 LANGUAGES = ["english", "hindi", "bengali", "kannada", "tamil"]
 LANG_CODE_TO_FULL = {"en": "english", "hi": "hindi", "bn": "bengali", "kn": "kannada", "ta": "tamil"}
 ANSWER_RE = re.compile(r"####\s*ANSWER\s*:\s*\(?([A-J])\)?", re.IGNORECASE)
+ANSWER_FALLBACK_RES = [
+    re.compile(r"(?:the\s+)?(?:correct\s+)?answer\s+is\s*:?\s*\(?([A-J])\)?", re.IGNORECASE),
+    re.compile(r"\b([A-J])\)\s*$", re.MULTILINE),
+    re.compile(r"^\(?([A-J])\)?\s*$", re.MULTILINE),
+]
 REASONING_BLOCK_RE = re.compile(r"<reasoning>(.*?)</reasoning>", re.IGNORECASE | re.DOTALL)
 
+# English reasoning instruction used for ALL languages — the question is still
+# in native language, so the student learns cross-lingual understanding while
+# the teacher generates high-quality reasoning it's actually good at.
 LANG_REASONING_INSTRUCTION = {
     "english": "You must reason and explain your thought process in English.",
-    "hindi": "आपको हिंदी में अपनी विचार प्रक्रिया का तर्क और व्याख्या करनी चाहिए। You must think and reason in Hindi.",
-    "bengali": "আপনাকে বাংলায় আপনার চিন্তা প্রক্রিয়া যুক্তি এবং ব্যাখ্যা করতে হবে। You must think and reason in Bengali.",
-    "kannada": "ನೀವು ಕನ್ನಡದಲ್ಲಿ ನಿಮ್ಮ ಆಲೋಚನಾ ಪ್ರಕ್ರಿಯೆಯನ್ನು ತರ್ಕ ಮತ್ತು ವಿವರಿಸಬೇಕು. You must think and reason in Kannada.",
-    "tamil": "நீங்கள் தமிழில் உங்கள் சிந்தனை செயல்முறையை நியாயப்படுத்தி விளக்க வேண்டும். You must think and reason in Tamil.",
+    "hindi": "The question is in Hindi. You must reason and explain your thought process in English.",
+    "bengali": "The question is in Bengali. You must reason and explain your thought process in English.",
+    "kannada": "The question is in Kannada. You must reason and explain your thought process in English.",
+    "tamil": "The question is in Tamil. You must reason and explain your thought process in English.",
 }
 
 
@@ -87,8 +95,24 @@ def format_teacher_prompt(instruction, language):
 def parse_generation(gen):
     rm = REASONING_BLOCK_RE.search(gen)
     reasoning = rm.group(1).strip() if rm else gen.strip()
+    # Try primary pattern first, then fallbacks
     am = ANSWER_RE.search(gen)
-    answer = am.group(1).upper() if am else ""
+    if am:
+        answer = am.group(1).upper()
+    else:
+        answer = ""
+        for fallback_re in ANSWER_FALLBACK_RES:
+            fm = fallback_re.search(gen)
+            if fm:
+                answer = fm.group(1).upper()
+                break
+        # Last resort: look for isolated letter in last 3 lines
+        if not answer:
+            for line in reversed(gen.strip().split("\n")[-3:]):
+                m2 = re.match(r"^\s*\(?([A-J])\)?[.:]?\s*$", line.strip(), re.IGNORECASE)
+                if m2:
+                    answer = m2.group(1).upper()
+                    break
     return {"reasoning": reasoning, "final_answer": answer, "raw_generation": gen.strip()}
 
 
@@ -206,8 +230,12 @@ def main():
             if timer.should_stop():
                 break
             end = min(start + bs, len(retry_prompts))
-            parsed = generate_batch(teacher, tokenizer, retry_prompts[start:end],
-                                    args.max_new_tokens, 0.7)
+            try:
+                parsed = generate_batch(teacher, tokenizer, retry_prompts[start:end],
+                                        args.max_new_tokens, 0.7)
+            except Exception as e:
+                LOGGER.warning("Retry batch %d-%d failed: %s. Skipping...", start, end, e)
+                continue
             for i, p in enumerate(parsed):
                 row = all_rows[incorrect_indices[start + i]]
                 gold = str(row.get("answer", "")).upper().strip()
