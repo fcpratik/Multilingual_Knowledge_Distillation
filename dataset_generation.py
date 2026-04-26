@@ -149,11 +149,20 @@ def main():
     )
     timer.log_status(LOGGER)
 
+    # Filter out prompts that exceed context length
+    max_prompt_tokens = 4096 - args.max_new_tokens - 64  # safety margin
     all_prompts, all_rows = [], []
+    skipped = 0
     for i in range(len(sampled)):
         row = sampled[i]
-        all_prompts.append(format_teacher_prompt(_build_instruction(row), row["language"]))
+        prompt = format_teacher_prompt(_build_instruction(row), row["language"])
+        prompt_tokens = len(tokenizer.encode(prompt))
+        if prompt_tokens > max_prompt_tokens:
+            skipped += 1
+            continue
+        all_prompts.append(prompt)
         all_rows.append(row)
+    LOGGER.info("Kept %d prompts, skipped %d (too long)", len(all_prompts), skipped)
 
     correct_records, incorrect_indices = [], []
     bs = args.batch_size
@@ -165,8 +174,12 @@ def main():
         end = min(start + bs, len(all_prompts))
         LOGGER.info("Batch %d-%d / %d", start, end, len(all_prompts))
 
-        parsed = generate_batch(teacher, tokenizer, all_prompts[start:end],
-                                args.max_new_tokens, args.temperature)
+        try:
+            parsed = generate_batch(teacher, tokenizer, all_prompts[start:end],
+                                    args.max_new_tokens, args.temperature)
+        except Exception as e:
+            LOGGER.warning("Batch %d-%d failed: %s. Skipping...", start, end, e)
+            continue
         for i, p in enumerate(parsed):
             idx = start + i
             row = all_rows[idx]
